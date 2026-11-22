@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # A workflow that fails to PARSE reports nothing at all: no jobs run, no
+  # checks appear, and the pull request looks unexercised rather than broken.
+  # This is the only lane that would notice.
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  gofmt:
+    name: gofmt + tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"; echo "$unformatted"
+            exit 1
+          fi
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  # The real lane: the observers are registered on the real notification
+  # centers, served by the real main-thread run loop, and proven with the
+  # package's own probe notification (never a real lock).
+  darwin:
+    name: darwin (CGO=0, real observers)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+      - run: CGO_ENABLED=0 go vet ./...
+      - run: CGO_ENABLED=0 go build ./...
+      - name: Test (portable + real observers)
+        run: CGO_ENABLED=0 go test -count=1 -timeout 3m -v ./...
+      - name: Coverage
+        run: CGO_ENABLED=0 go test -count=1 -coverprofile=cover.out .
+      - name: Race (CGO=1)
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+      # 100%, statement for statement, bindings included: every bound C entry
+      # point is a package variable, so the failure branches are tested by
+      # replacing the call.
+      - name: 100% coverage gate
+        shell: bash
+        run: |
+          go tool cover -func=cover.out | tee full.txt
+          if grep -v '100\.0%' full.txt | grep -v '^total:'; then
+            echo "::error::below 100% on darwin (lines above)"; exit 1
+          fi
+
+  # Every non-darwin platform must COMPILE and answer ErrUnsupported rather
+  # than failing to build: a consumer cross-compiles this without thinking
+  # about it.
+  cross:
+    name: cross ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: riscv64 }
+          - { goos: linux, goarch: loong64 }
+          - { goos: linux, goarch: ppc64le }
+          - { goos: linux, goarch: s390x }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: android, goarch: arm64 }
+          - { goos: js, goarch: wasm }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+      - run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
+      - run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go vet ./...
+
+  linux:
+    name: linux (stubs + full coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+      - run: CGO_ENABLED=0 go test -count=1 ./...
+      - run: CGO_ENABLED=0 go test -count=1 -coverprofile=cover.out .
+      # Off darwin all that exists is the portable half plus the stubs, and
+      # both are reachable from a test.
+      - name: 100% coverage gate on EVERYTHING that exists off darwin
+        shell: bash
+        run: |
+          go tool cover -func=cover.out | tee full.txt
+          if grep -v '100\.0%' full.txt | grep -v '^total:'; then
+            echo "::error::below 100% on linux (lines above)"; exit 1
+          fi
+
+  windows:
+    name: windows (stubs)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+      - run: go test -count=1 ./...
+        env:
+          CGO_ENABLED: 0
